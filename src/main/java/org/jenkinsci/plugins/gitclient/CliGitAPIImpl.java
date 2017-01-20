@@ -3,7 +3,6 @@ package org.jenkinsci.plugins.gitclient;
 
 import com.cloudbees.jenkins.plugins.sshcredentials.SSHUserPrivateKey;
 import com.cloudbees.plugins.credentials.common.StandardCredentials;
-import com.cloudbees.plugins.credentials.common.UsernameCredentials;
 import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
@@ -12,6 +11,7 @@ import hudson.EnvVars;
 import hudson.FilePath;
 import hudson.Launcher;
 import com.google.common.collect.Lists;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Launcher.LocalLauncher;
 import hudson.Util;
 import hudson.model.TaskListener;
@@ -490,12 +490,12 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
                         if (!objectsPath.isDirectory())
                             listener.error("Reference path does not contain an objects directory (no git repo?): " + objectsPath);
                         else {
-                            try {
-                                File alternates = new File(workspace, ".git/objects/info/alternates");
-                                try (PrintWriter w = new PrintWriter(alternates)) {
-                                    // git implementations on windows also use
-                                    w.print(objectsPath.getAbsolutePath().replace('\\', '/'));
-                                }
+                            File alternates = new File(workspace, ".git/objects/info/alternates");
+                            try (PrintWriter w = new PrintWriter(alternates, Charset.defaultCharset().toString())) {
+                                // git implementations on windows also use
+                                w.print(objectsPath.getAbsolutePath().replace('\\', '/'));
+                            } catch (UnsupportedEncodingException ex) {
+                                listener.error("Default character set is an unsupported encoding");
                             } catch (FileNotFoundException e) {
                                 listener.error("Failed to setup reference");
                             }
@@ -772,6 +772,8 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
         }
     }
 
+    @SuppressFBWarnings(value = "RV_DONT_JUST_NULL_CHECK_READLINE",
+            justification = "Only needs first line, exception if multiple detected")
     private @CheckForNull String firstLine(String result) {
         BufferedReader reader = new BufferedReader(new StringReader(result));
         String line;
@@ -958,6 +960,10 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
              * @throws InterruptedException if called methods throw same exception
              */
             public void execute() throws GitException, InterruptedException {
+                // Initialize the submodules to ensure that the git config
+                // contains the URLs from .gitmodules.
+                submoduleInit();
+
                 ArgumentListBuilder args = new ArgumentListBuilder();
                 args.add("submodule", "update");
                 if (recursive) {
@@ -992,7 +998,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
                 try {
                     // We might fail if we have no modules, so catch this
                     // exception and just return.
-                    cfgOutput = launchCommand("config", "--get-regexp", "^submodule");
+                    cfgOutput = launchCommand("config", "-f", ".gitmodules", "--get-regexp", "^submodule\\.(.*)\\.url");
                 } catch (GitException e) {
                     listener.error("No submodules found.");
                     return;
@@ -1005,16 +1011,18 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
                 Matcher matcher = pattern.matcher(cfgOutput);
                 while (matcher.find()) {
                     ArgumentListBuilder perModuleArgs = args.clone();
-                    String sUrl = matcher.group(1);
+                    String sModuleName = matcher.group(1);
 
+                    // Find the URL for this submodule
                     URIish urIish = null;
                     try {
-                        urIish = new URIish(getSubmoduleUrl(sUrl));
+                        urIish = new URIish(getSubmoduleUrl(sModuleName));
                     } catch (URISyntaxException e) {
-                        listener.error("Invalid repository for " + sUrl);
-                        throw new GitException("Invalid repository for " + sUrl);
+                        listener.error("Invalid repository for " + sModuleName);
+                        throw new GitException("Invalid repository for " + sModuleName);
                     }
 
+                    // Find credentials for this URL
                     StandardCredentials cred = credentials.get(urIish.toPrivateString());
                     if (parentCredentials) {
                         String parentUrl = getRemoteUrl(getDefaultRemote());
@@ -1030,7 +1038,10 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
                     }
                     if (cred == null) cred = defaultCredentials;
 
-                    perModuleArgs.add(sUrl);
+                    // Find the path for this submodule
+                    String sModulePath = getSubmodulePath(sModuleName);
+
+                    perModuleArgs.add(sModulePath);
                     launchCommandWithCredentials(perModuleArgs, workspace, cred, urIish, timeout);
                 }
             }
@@ -1090,6 +1101,19 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
      */
     public void setSubmoduleUrl(String name, String url) throws GitException, InterruptedException {
         launchCommand( "config", "submodule."+name+".url", url );
+    }
+
+    /**
+     * Get submodule path.
+     *
+     * @param name submodule name whose path is returned
+     * @return path to submodule
+     * @throws GitException on git error
+     * @throws InterruptedException if interrupted
+     */
+    public @CheckForNull String getSubmodulePath(String name) throws GitException, InterruptedException {
+        String result = launchCommand( "config", "-f", ".gitmodules", "--get", "submodule."+name+".path" );
+        return StringUtils.trim(firstLine(result));
     }
 
     /** {@inheritDoc} */
@@ -1501,7 +1525,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
 
     private File createSshKeyFile(File key, SSHUserPrivateKey sshUser) throws IOException, InterruptedException {
         key = File.createTempFile("ssh", "key");
-        try (PrintWriter w = new PrintWriter(key)) {
+        try (PrintWriter w = new PrintWriter(key, Charset.defaultCharset().toString())) {
             List<String> privateKeys = sshUser.getPrivateKeys();
             for (String s : privateKeys) {
                 w.println(s);
@@ -1511,10 +1535,20 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
         return key;
     }
 
-    private String quoteWindowsCredentials(String str) {
-        // Assumes the only meaningful character is %, this may be
-        // insufficient.
-        return str.replace("%", "%%");
+    /* package protected for testability */
+    String quoteWindowsCredentials(String str) {
+        // Quote special characters for Windows Batch Files
+        // See: http://ss64.com/nt/syntax-esc.html
+        String quoted = str.replace("%", "%%")
+                        .replace("^", "^^")
+                        .replace(" ", "^ ")
+                        .replace("\t", "^\t")
+                        .replace("\\", "^\\")
+                        .replace("&", "^&")
+                        .replace("|", "^|")
+                        .replace(">", "^>")
+                        .replace("<", "^<");
+        return quoted;
     }
 
     private String quoteUnixCredentials(String str) {
@@ -1525,7 +1559,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
 
     private File createWindowsSshAskpass(SSHUserPrivateKey sshUser) throws IOException {
         File ssh = File.createTempFile("pass", ".bat");
-        try (PrintWriter w = new PrintWriter(ssh)) {
+        try (PrintWriter w = new PrintWriter(ssh, Charset.defaultCharset().toString())) {
             w.println("echo \"" + quoteWindowsCredentials(Secret.toString(sshUser.getPassphrase())) + "\"");
             w.flush();
         }
@@ -1535,7 +1569,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
 
     private File createUnixSshAskpass(SSHUserPrivateKey sshUser) throws IOException {
         File ssh = File.createTempFile("pass", ".sh");
-        try (PrintWriter w = new PrintWriter(ssh)) {
+        try (PrintWriter w = new PrintWriter(ssh, Charset.defaultCharset().toString())) {
             w.println("#!/bin/sh");
             w.println("echo '" + quoteUnixCredentials(Secret.toString(sshUser.getPassphrase())) + "'");
         }
@@ -1543,20 +1577,25 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
         return ssh;
     }
 
-    private File createWindowsStandardAskpass(StandardUsernamePasswordCredentials creds) throws IOException {
+    /* Package protected for testability */
+    File createWindowsBatFile(String userName, String password) throws IOException {
         File askpass = File.createTempFile("pass", ".bat");
-        try (PrintWriter w = new PrintWriter(askpass)) {
+        try (PrintWriter w = new PrintWriter(askpass, Charset.defaultCharset().toString())) {
             w.println("@set arg=%~1");
-            w.println("@if (%arg:~0,8%)==(Username) echo " + quoteWindowsCredentials(creds.getUsername()));
-            w.println("@if (%arg:~0,8%)==(Password) echo " + quoteWindowsCredentials(Secret.toString(creds.getPassword())));
+            w.println("@if (%arg:~0,8%)==(Username) echo " + quoteWindowsCredentials(userName));
+            w.println("@if (%arg:~0,8%)==(Password) echo " + quoteWindowsCredentials(password));
         }
         askpass.setExecutable(true);
         return askpass;
     }
 
+    private File createWindowsStandardAskpass(StandardUsernamePasswordCredentials creds) throws IOException {
+        return createWindowsBatFile(creds.getUsername(), Secret.toString(creds.getPassword()));
+    }
+
     private File createUnixStandardAskpass(StandardUsernamePasswordCredentials creds) throws IOException {
         File askpass = File.createTempFile("pass", ".sh");
-        try (PrintWriter w = new PrintWriter(askpass)) {
+        try (PrintWriter w = new PrintWriter(askpass, Charset.defaultCharset().toString())) {
             w.println("#!/bin/sh");
             w.println("case \"$1\" in");
             w.println("Username*) echo '" + quoteUnixCredentials(creds.getUsername()) + "' ;;");
@@ -1689,7 +1728,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
 
         File sshexe = getSSHExecutable();
 
-        try (PrintWriter w = new PrintWriter(ssh)) {
+        try (PrintWriter w = new PrintWriter(ssh, Charset.defaultCharset().toString())) {
             w.println("@echo off");
             w.println("\"" + sshexe.getAbsolutePath() + "\" -i \"" + key.getAbsolutePath() +"\" -l \"" + user + "\" -o StrictHostKeyChecking=no %* ");
         }
@@ -1699,7 +1738,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
 
     private File createUnixGitSSH(File key, String user) throws IOException {
         File ssh = File.createTempFile("ssh", ".sh");
-        try (PrintWriter w = new PrintWriter(ssh)) {
+        try (PrintWriter w = new PrintWriter(ssh, Charset.defaultCharset().toString())) {
             w.println("#!/bin/sh");
             // ${SSH_ASKPASS} might be ignored if ${DISPLAY} is not set
             w.println("if [ -z \"${DISPLAY}\" ]; then");
@@ -1756,9 +1795,9 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
             if (workDir != null) p.pwd(workDir);
             int status = p.start().joinWithTimeout(timeout, TimeUnit.MINUTES, listener);
 
-            String result = fos.toString();
+            String result = fos.toString(Charset.defaultCharset().toString());
             if (status != 0) {
-                throw new GitException("Command \""+command+"\" returned status code " + status + ":\nstdout: " + result + "\nstderr: "+ err.toString());
+                throw new GitException("Command \""+command+"\" returned status code " + status + ":\nstdout: " + result + "\nstderr: "+ err.toString(Charset.defaultCharset().toString()));
             }
 
             return result;
@@ -2284,7 +2323,7 @@ public class CliGitAPIImpl extends LegacyCompatibleGitAPIImpl {
         try {
             f = File.createTempFile("gitcommit", ".txt");
             try (FileOutputStream fos = new FileOutputStream(f)) {
-                fos.write(message.getBytes());
+                fos.write(message.getBytes(Charset.defaultCharset().toString()));
             }
             launchCommand("commit", "-F", f.getAbsolutePath());
 
